@@ -134,7 +134,7 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 ### 上游枚举的三种手段
 
 1. **响应元数据回读**：规划器管道带 `canonicalSlug` / `fallbacksAvailable` / `finalProvider`；直连管道顶层 `provider` 即实际上游；
-2. **假上游探测**（零 token）：带不存在的 `only:["__probe__"]` 让网关在路由层报错并列出精确的可用渠道清单（两条管道的清单**不一致**，要分别取）；
+2. **假上游探测**（零 token）：带不存在的 `only:["zzz-not-a-provider"]` 让网关在路由层报错并列出精确的可用渠道清单（两条管道的清单**不一致**，要分别取）；
 3. **OpenRouter 公开接口** `GET /api/v1/models/{slug}/endpoints`：补充上下文长度/在线率（对直连管道有直接参考意义）。
 
 ### 实测记录（2026-09）
