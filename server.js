@@ -876,7 +876,7 @@ const server = http.createServer(async (req, res) => {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
         actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline,
-        pinnable: META.models[model]?.pinSupport?.state === 'supported', pinSupport: META.models[model]?.pinSupport || null,
+        pinnable: META.models[model]?.pinSupport?.state === 'supported',
         canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
         account: chain.acc?.name || null, trace,
         pinSupport: META.models[model]?.pinSupport || null,

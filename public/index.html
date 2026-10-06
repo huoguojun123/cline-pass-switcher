@@ -42,6 +42,8 @@
   .kvs b { color: var(--text); font-weight: 600; }
   details summary { cursor: pointer; color: var(--dim); font-size: 13px; }
   .history td { color: var(--dim); }
+  .table-scroll { overflow-x:auto; }
+  .history-table { min-width:720px; }
   .history-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
   .history-tools input, .history-tools select { max-width:none; }
   .history-tools input { background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 9px; font-size:12.5px; }
@@ -207,10 +209,10 @@
       <button class="ghost" onclick="loadHistory()">↻ 刷新历史</button>
       <span class="history-summary" id="histSummary"></span>
     </div>
-    <table>
+    <div class="table-scroll"><table class="history-table">
       <thead><tr><th>时间</th><th>模型</th><th>结果</th><th>实际上游</th><th>账号</th><th>耗时</th><th>方式 / 详情</th></tr></thead>
       <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
-    </table>
+    </table></div>
   </div>
 
   <div class="card">
@@ -534,6 +536,8 @@ async function runTest() {
 function onTestModelChange() {
   const m = DATA.subscription.find((s) => s.id === $('#testModel').value);
   $('#testUpstream').innerHTML = upstreamOptions(m?.meta, null);
+  $('#testUpstream').disabled = m?.meta?.pinSupport?.state !== 'supported';
+  $('#testUpstream').title = $('#testUpstream').disabled ? '请先探测并确认该模型支持钉住' : '选择测试渠道';
 }
 
 // 逐次尝试明细：fireworks(✗429 781ms) → sail-research(✔ 2458ms)
@@ -560,7 +564,7 @@ function showTest(r, model, target) {
       <div>实际上游 <b class="${hit && !hitExcluded ? 'match' : 'mismatch'}">${r.actual || '未知'}</b></div>
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
-    ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
+    ${r.pinSupport?.state === 'unsupported' ? '网关自动选择了上游，本次请求不能验证钉住效果。' : hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${escapeHtml(r.actual)}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
     <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${escapeHtml(r.canonicalSlug || '—')}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>${pinNotice}`;
 }
 
