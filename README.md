@@ -7,9 +7,9 @@
 **零依赖**的 Node.js 本地/服务器代理 + 网页控制台，用于 [Cline Pass](https://cline.bot/cline-pass) 订阅：
 
 - 🔍 **上游枚举与校验** —— 列出订阅模型背后每一条上游渠道，并一键实测哪些「✔可用 / ⏳限流 / ✘不可钉」
-- 🎯 **精确钉住上游** —— 严格钉住 / 优先+回退两种模式，支持按最低成本、最快首字、最高吞吐排序
+- 🎯 **按能力精确钉住上游** —— 探测会验证网关是否仍读取钉住参数；支持时提供严格钉住 / 优先+回退 / 成本排序，否则明确提示并回到网关自动选择
 - 🧬 **多上游优先级故障转移（2026-09-06 新增）** —— 勾选多个上游即按勾选顺序逐个尝试：第一个异常（报错 / 网络失败 / 超时）自动顺切下一个，全部失败才透传错误；每次尝试有独立 120s 超时与逐次尝试明细（请求头 X-Cline-Target-Upstream: a>b 与 X-Cline-Attempts，历史与测试台展示逐次尝试路径 upstream(502) 到 upstream(200)）
-- 🚫 **上游排除** —— 勾「排除」的渠道永不被使用：勾选模式下从候选中剔除；自动模式与优先+回退模式下把排除换算成 only 白名单（已知上游 - 排除项）注入，两类管道均实测生效；网关侧渠道清单更新导致白名单过期时，报错中附带的最新渠道清单会被自动学习合并
+- 🚫 **上游排除** —— 仅在探测确认网关支持钉住时启用；否则页面会明确提示不可钉住，并使用网关自己的自动路由
 - 👥 **账号池** —— 多账号管理、手动切换、轮询均衡、逐账号连通性测试与用量统计
 - 📊 **观测** —— 每条请求自动记录实际命中的渠道、背后模型、耗时（含流式）
 - 🔑 **代理密钥** —— 给下游客户端发一把独立密钥，可随时在页面轮换
@@ -111,10 +111,10 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 | 管道 | 实际后端 | 识别特征 | 钉住方式 |
 |---|---|---|---|
 | **直连**（direct） | OpenRouter | 响应顶层带 `provider` 与真实 `model` 字段 | 顶层 `provider.only / order` |
-| **规划器**（planner） | **Vercel AI Gateway** | 响应带 `provider_metadata.gateway.routing` | **`providerOptions.gateway.only / order / sort`** |
+| **规划器**（planner） | **Vercel AI Gateway** | 响应带 `provider_metadata.gateway.routing` | 由负向探测确认 `providerOptions.gateway.only / order / sort` 是否仍被读取 |
 
 **关键发现**：规划器管道的请求由 Vercel AI Gateway 执行，请求体里的顶层 `provider.only/order` 会被 Cline 丢弃
-（这也是官方 API 上"换上游不生效"的原因），但 `providerOptions.gateway` 嵌套形式会**原样透传**：
+（这也是官方 API 上"换上游不生效"的原因），`providerOptions.gateway` 嵌套形式曾经可以**原样透传**，目前可能被 Cline 静默丢弃：
 
 ```json
 {
@@ -127,6 +127,10 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 实测响应：`finalProvider: "alibaba"`，规划器理由变为 `Provider set restricted to: alibaba`。
 参考：[Vercel AI Gateway — Provider Filtering, Ordering & Sorting](https://vercel.com/docs/ai-gateway/models-and-providers/provider-filtering-and-ordering)
 
+### 钉住能力提示
+
+点击「探测」时，控制台会用一个格式合法但不存在的渠道名发送负向探测：网关明确拒绝并返回渠道清单，标记为“可钉住”；请求成功且实际自动路由，标记为“不可钉住”。未完成探测或网络异常时显示“待确认”，不会把未知状态误报为可用。
+
 ### 上游枚举的三种手段
 
 1. **响应元数据回读**：规划器管道带 `canonicalSlug` / `fallbacksAvailable` / `finalProvider`；直连管道顶层 `provider` 即实际上游；
@@ -138,11 +142,11 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 | 实验 | 结果 |
 |---|---|
 | glm-5.2 + 顶层 `provider.only/ignore/order` | 全部被网关丢弃，恒选同一渠道 |
-| glm-5.2 + `providerOptions.gateway.only:["alibaba"]` | ✔ `finalProvider: alibaba` |
-| glm-5.2 流式 + `only:["baseten"]` | ✔ 流式同样生效 |
-| glm-5.2 + `providerOptions.gateway.sort:"cost"` | ✔ 按成本重排执行顺序 |
+| 规划器模型 + `providerOptions.gateway.only` | 以当前探测结果为准；Cline 可能静默忽略 |
+| 规划器模型流式 + `only` | 以当前探测结果为准；SSE 本身不改变钉住能力 |
+| 规划器模型 + `providerOptions.gateway.sort` | 只有探测确认支持时才会注入 |
 | glm-5.3-flash（直连）+ 顶层 `provider.only:["gmicloud"]` | ✔ `provider: "GMICloud"` |
-| glm-5.3-flash + `providerOptions.gateway` | ✘ 无效（直连管道只认顶层 provider 形式） |
+| 规划器模型 + `providerOptions.gateway` | ✘ 若负向探测返回 200，说明当前已被 Cline 静默忽略 |
 
 > 管道归属由 Cline 侧决定、可能随时间变化，控制台的「探测」会刷新每个模型的管道类型与渠道清单。
 
@@ -157,7 +161,7 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 | 订阅模型 | 背后模型 / 渠道数 / 最近实际渠道；渠道下拉（带可用性标注）；严格钉住 / 优先+回退；排序 |
 | 操作按钮 | 探测（刷新渠道清单）、测试（单次钉住验证）、校验（全渠道实测地图） |
 | 测试台 | 任选模型+渠道发一条小请求，直接看网关是否采纳 |
-| 请求历史 | 自动记录每条请求的账号、实际渠道、耗时、尝试序列（最近 100 条，含流式） |
+| 请求历史 | 自动记录账号、实际渠道、背后模型、HTTP 状态、耗时、错误和尝试链；控制台支持按关键词、成功/失败、流式/非流式筛选并展开详情 |
 | 完整目录 | Cline 公开目录模型，`:free` 变体可精确钉住 |
 
 代理同时做了兼容性标准化：解包 Cline 的 `{"data":...}` 包装为标准 OpenAI 格式、错误统一为
@@ -175,7 +179,7 @@ Cline Pass 订阅模型在 Cline 网关之后分成两条管道，钉住上游�
 能。限流是共享池的临时状态，过段时间重新「校验」即可；或改用「优先+回退」模式，限流时自动跳到其他渠道。
 
 **Q：直接用官方 API 写 `provider.only` 为什么不生效？**
-对规划器管道（走 Vercel AI Gateway 的模型）会被 Cline 网关丢弃，请改用 `providerOptions.gateway`，见上文。
+对规划器管道（走 Vercel AI Gateway 的模型），Cline 可能已经丢弃 `providerOptions.gateway`。请先点「探测」查看“可钉住 / 不可钉住 / 待确认”状态；显示不可钉住时，修改本地上游顺序不会影响实际路由。
 
 **Q：两条管道的渠道清单为什么不一样？**
 钉住发生在不同后端（OpenRouter vs Vercel AI Gateway），各自支持的渠道池不同，要以对应清单为准。

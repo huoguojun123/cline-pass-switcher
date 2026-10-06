@@ -18,7 +18,7 @@ async function freePort() {
   return port;
 }
 
-test('a broken upstream SSE does not stop the proxy', async () => {
+test('上游 SSE 断链不会终止代理，并会写入失败历史', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'cline-pass-test-'));
   const upstream = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/event-stream' });
@@ -48,6 +48,9 @@ test('a broken upstream SSE does not stop the proxy', async () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: 'test', messages: [], stream: true }),
     }).then((res) => res.text()));
+    const history = JSON.parse(fs.readFileSync(path.join(dir, 'metadata.json'), 'utf8')).history;
+    assert.equal(history[0].status, 502);
+    assert.match(history[0].error, /stream aborted|stream forwarding failed/);
     assert.equal(child.exitCode, null, output);
     const models = await fetch(`http://127.0.0.1:${port}/v1/models`);
     assert.equal(models.status, 200, output);

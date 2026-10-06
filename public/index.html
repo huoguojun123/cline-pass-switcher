@@ -42,6 +42,14 @@
   .kvs b { color: var(--text); font-weight: 600; }
   details summary { cursor: pointer; color: var(--dim); font-size: 13px; }
   .history td { color: var(--dim); }
+  .history-tools { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin-bottom:10px; }
+  .history-tools input, .history-tools select { max-width:none; }
+  .history-tools input { background:var(--card2); color:var(--text); border:1px solid var(--border); border-radius:6px; padding:6px 9px; font-size:12.5px; }
+  .history-summary { color:var(--dim); font-size:12px; margin-left:auto; }
+  .history-detail { margin-top:4px; color:var(--dim); font-size:11.5px; line-height:1.7; white-space:normal; }
+  .history-detail summary { display:inline-block; color:var(--accent); }
+  .status-ok { color:var(--green); } .status-bad { color:var(--red); }
+  .pin-hint { color:var(--orange); font-size:12px; line-height:1.6; max-width:280px; }
   .spin { display: inline-block; animation: r 1s linear infinite; }
   @keyframes r { to { transform: rotate(360deg); } }
   .empty { color: var(--dim); font-size: 13px; padding: 14px 10px; }
@@ -106,11 +114,9 @@
     <b>实测结论（决定了本工具的工作方式）：</b><br>
     ① <b>上游可枚举、可观测</b>：订阅模型响应元数据里带背后真正的模型 ID、可用上游列表与本次实际命中的上游；
     「探测」按钮还会用一次零 token 消耗的假上游请求让网关报出精确的可用上游清单（直连→OpenRouter，规划器→Vercel AI Gateway）。<br>
-    ② <b>两类管道都能精确钉住上游</b>（已实测 <code class="mono">finalProvider</code> 随之改变）：
-    直连管道（OpenRouter）用顶层 <code class="mono">provider.only / order</code>；
-    规划器管道（Vercel AI Gateway）必须用 <code class="mono">providerOptions.gateway.only / order</code>——
-    Cline 会丢弃顶层 <code class="mono">provider</code> 简写里的 <code class="mono">only/order</code>，但会透传 <code class="mono">providerOptions.gateway</code>。
-    两类管道还都支持 <code class="mono">sort</code>（最低成本 / 最快首字 / 最高吞吐）。<br>
+    ② <b>钉住能力以每次探测结果为准</b>：直连管道（OpenRouter）通常读取顶层 <code class="mono">provider.only / order</code>；
+    规划器管道可能被 Cline 丢弃 <code class="mono">providerOptions.gateway</code>。控制台会用负向探测判断参数是否仍被网关读取，
+    已确认失效的模型不会继续显示可钉住操作。<br>
     ③ <b>目录模型 :free 变体</b>：属于直连管道，可精确钉住。<br>
     ④ <b>多上游优先级 + 故障转移</b>：勾选多个上游即按勾选顺序逐个尝试——第一个异常（报错/网络失败/超时）自动顺切下一个，全部失败才把错误透传给客户端；「排除」的上游永不被使用（自动模式下会向网关注入排除偏好）。流式请求在首包（SSE 开始）前同样可切换，SSE 开始后透传不可重试。
   </div>
@@ -190,8 +196,19 @@
 
   <div class="card">
     <h2>请求历史（最近 100 条，经代理的请求自动记录）</h2>
+    <div class="history-tools">
+      <input id="histSearch" placeholder="搜索模型、账号、渠道或错误" oninput="renderHistory()">
+      <select id="histStatus" onchange="renderHistory()" title="按结果筛选">
+        <option value="">全部结果</option><option value="ok">成功</option><option value="error">失败</option>
+      </select>
+      <select id="histStream" onchange="renderHistory()" title="按请求方式筛选">
+        <option value="">全部方式</option><option value="stream">流式</option><option value="plain">非流式</option>
+      </select>
+      <button class="ghost" onclick="loadHistory()">↻ 刷新历史</button>
+      <span class="history-summary" id="histSummary"></span>
+    </div>
     <table>
-      <thead><tr><th>时间</th><th>模型</th><th>账号</th><th>实际上游</th><th>背后模型</th><th>耗时</th><th>方式</th><th>尝试序列</th></tr></thead>
+      <thead><tr><th>时间</th><th>模型</th><th>结果</th><th>实际上游</th><th>账号</th><th>耗时</th><th>方式 / 详情</th></tr></thead>
       <tbody id="histBody"><tr><td colspan="7" class="empty">暂无记录</td></tr></tbody>
     </table>
   </div>
@@ -264,6 +281,10 @@ function upstreamOptions(meta, selected) {
 // 主表每行的上游优先级/排除面板：<details> 内逐行「优先 / 排除」药丸切换
 // 状态存在 data-* 属性上，切换时原地更新（updateRowUi），不重建 DOM
 function upstreamPanel(id, meta, cfg) {
+  if (meta?.pinSupport?.state !== 'supported') {
+    const reason = meta?.pinSupport?.reason || '请先探测模型，确认网关是否读取钉住参数';
+    return `<div class="pin-hint">${meta?.pinSupport?.state === 'unsupported' ? '当前模型不可钉住：' : '钉住能力待确认：'}${escapeHtml(reason)}</div>`;
+  }
   const ups = sortedUpstreams(meta);
   const stMap = (meta && meta.upstreamStatus) || {};
   const detail = (meta && meta.upstreamDetail) || {};
@@ -319,7 +340,13 @@ function render() {
     const last = m?.lastProvider ? `<span class="badge">${m.lastProvider}</span>` : '<span class="dim">未探测</span>';
     const canon = m?.canonicalSlug ? `<span class="mono dim">${m.canonicalSlug}</span>` : '<span class="dim">—</span>';
     const tier0 = m?.tier0?.length ? `<div class="dim" style="font-size:11px">tier-0: ${m.tier0.join(', ')}</div>` : '';
-    const pipe = m?.pinnable ? `<span class="badge green">可精确钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>` : '<span class="badge orange">请先探测</span>';
+    const pinState = m?.pinSupport?.state;
+    const pipe = pinState === 'supported'
+      ? `<span class="badge green">可钉住·${m.pipeline === 'planner' ? 'Vercel' : 'OpenRouter'}</span>`
+      : pinState === 'unsupported'
+        ? `<span class="badge orange" title="${escapeHtml(m.pinSupport.reason || '')}">不可钉住</span>`
+        : '<span class="badge orange">待探测钉住能力</span>';
+    const pinDisabled = pinState !== 'supported' ? ' disabled title="请先探测并确认该模型支持钉住"' : '';
     const mode = s.config.pinMode || 'strict';
     const sort = s.config.sort || '';
     return `<tr${LAST_ADDED.includes(s.id) ? ' class="row-new"' : ''} data-id="${s.id}">
@@ -331,11 +358,11 @@ function render() {
         ${upstreamPanel(s.id, m, s.config)}
       </td>
       <td>
-        <div><select onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
+        <div><select${pinDisabled} onchange="saveCfg('${s.id}','pinMode',this.value)" title="严格：逐个只钉勾选的上游；优先：当前上游排 order 首位，其余勾选项作为网关侧回退">
           <option value="strict" ${mode === 'strict' ? 'selected' : ''}>严格钉住</option>
           <option value="preferred" ${mode === 'preferred' ? 'selected' : ''}>优先+回退</option>
         </select></div>
-        <select onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
+        <select${pinDisabled} onchange="saveCfg('${s.id}','sort',this.value)" style="margin-top:4px" title="按指标排序上游（不选上游时也可单独使用）">
           <option value="" ${!sort ? 'selected' : ''}>网关智能选</option>
           <option value="cost" ${sort === 'cost' ? 'selected' : ''}>最低成本</option>
           <option value="ttft" ${sort === 'ttft' ? 'selected' : ''}>最快首字</option>
@@ -345,7 +372,7 @@ function render() {
       <td><div class="row-actions">
         <button class="ghost" onclick="probe('${s.id}', this)">探测</button>
         <button class="ghost" onclick="test('${s.id}', this)">测试</button>
-        <button class="ghost" onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
+        <button class="ghost"${pinDisabled} onclick="validate('${s.id}', this)" title="把每个上游渠道各钉一次最小请求，标出可用/限流/不可钉">校验</button>
       </div></td>
     </tr>`;
   }).join('');
@@ -484,7 +511,11 @@ async function validate(id, btn) {
   status(`正在校验 ${id} 的全部上游渠道（约需 1 分钟）…`);
   try {
     const r = await api('/api/validate-upstreams', { model: id });
-    status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（下拉框已标注并排序）`);
+    if (r.supported === false) {
+      status(`该模型不可钉住：${r.pinSupport?.reason || '网关忽略了钉住参数'}`);
+    } else {
+      status(`校验完成：✔可用 ${r.summary.ok} · ⏳限流 ${r.summary.limited} · ✘不可钉 ${r.summary.bad} · 🔑key错 ${r.summary.auth} · 未判定 ${r.summary.unknown}（下拉框已标注并排序）`);
+    }
   } catch (e) {
     status('校验失败');
   }
@@ -519,6 +550,8 @@ function showTest(r, model, target) {
     el.innerHTML = `<span class="mismatch">请求失败：${escapeHtml(r.error || '')}</span>${traceHtml(r.trace)}`;
     return;
   }
+  const pinNotice = r.pinSupport?.state === 'unsupported'
+    ? `<div class="pin-hint">当前模型不可钉住：${escapeHtml(r.pinSupport.reason || '网关忽略了钉住参数')}。本次仅展示网关自动选择结果。</div>` : '';
   const hit = !targets.length || r.actual === targets[0];
   const hitExcluded = Array.isArray(r.exclude) && r.exclude.length && r.exclude.includes(r.actual);
   el.innerHTML = `<div class="kvs">
@@ -528,7 +561,7 @@ function showTest(r, model, target) {
       <div>耗时 <b>${r.ms} ms</b></div>
     </div>${traceHtml(r.trace)}
     ${hitExcluded ? `<div class="mismatch">⚠ 排除未生效：命中了被排除的上游 ${r.actual}（该渠道可能不在本地已知清单内，或网关未遵守白名单；先点「探测」刷新渠道列表再试）</div>` : hit ? '✔ 上游匹配，选择已生效。' : (r.actual ? '✘ 未命中首个目标上游：渠道可能限流或不可钉（点「校验」检查全部渠道）；严格模式失败会直接报错，可改用「优先+回退」。' : '该模型响应未携带上游信息，无法回读实际上游。')}
-    <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${r.canonicalSlug || '—'}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>`;
+    <div class="dim" style="margin-top:6px">回复：${escapeHtml(r.content || '(空)')}　·　背后模型：${escapeHtml(r.canonicalSlug || '—')}　·　管道：${r.pipeline === 'direct' ? '直连(OpenRouter)' : r.pipeline === 'planner' ? '规划器(Vercel)' : '未知'}</div>${pinNotice}`;
 }
 
 // —— perModel 配置保存：POST 完整字段（upstreams + exclude 一起），UI 由调用方乐观更新 ——
@@ -651,21 +684,55 @@ function bulkUp(id, action) {
   }
 }
 
-async function loadHistory() {
-  const { history } = await api('/api/history');
-  $('#histBody').innerHTML = history.length ? history.map((h) => `<tr>
-      <td>${fmt(h.ts)}</td><td class="mono">${h.model}</td>
-      <td>${h.account ? '<span class="badge">' + h.account + '</span>' : '<span class="dim">—</span>'}</td>
-      <td>${h.provider ? '<span class="badge">' + h.provider + '</span>' : '<span class="dim">—</span>'}</td>
-      <td class="mono dim">${h.canonical || '—'}</td>
-      <td>${h.ms ?? '—'} ms</td>
-      <td>${h.stream ? '流式' : '非流式'}</td>
-      <td class="dim">${(h.trace || h.attempts || []).map((t) => typeof t === 'string' ? t : `${t.upstream || 'auto'}(${t.status === 200 ? '✔' : '✗'}${t.ms}ms)`).join(' → ') || '—'}</td>
-    </tr>`).join('') : '<tr><td colspan="8" class="empty">暂无记录 —— 把客户端 Base URL 指向代理地址即可自动记录</td></tr>';
-}
-
 let ACCS = null;
 const escapeHtml = (s) => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+let HISTORY = [];
+
+function historyIsError(h) { return !!h.error || (Number(h.status) >= 400); }
+function historyTrace(h) {
+  return (h.trace || h.attempts || []).map((t) => {
+    if (typeof t === 'string') return t;
+    return `${t.upstream || '自动'}(${t.status === 200 ? '成功' : '失败'}${t.status ? ` ${t.status}` : ''}${t.ms != null ? ` ${t.ms}ms` : ''})`;
+  }).join(' → ') || '未记录尝试链';
+}
+function renderHistory() {
+  const query = ($('#histSearch')?.value || '').trim().toLowerCase();
+  const status = $('#histStatus')?.value || '';
+  const stream = $('#histStream')?.value || '';
+  const list = HISTORY.filter((h) => {
+    const isError = historyIsError(h);
+    if (status === 'ok' && isError || status === 'error' && !isError) return false;
+    if (stream === 'stream' && !h.stream || stream === 'plain' && h.stream) return false;
+    if (!query) return true;
+    return [h.model, h.account, h.provider, h.canonical, h.error, historyTrace(h)].some((v) => String(v || '').toLowerCase().includes(query));
+  });
+  const ok = HISTORY.filter((h) => !historyIsError(h)).length;
+  $('#histSummary').textContent = `显示 ${list.length} / ${HISTORY.length} 条 · 成功 ${ok} · 失败 ${HISTORY.length - ok}`;
+  $('#histBody').innerHTML = list.length ? list.map((h) => {
+    const bad = historyIsError(h);
+    const trace = historyTrace(h);
+    const detail = [
+      `状态：${h.status || (bad ? '失败' : '成功')}`,
+      `背后模型：${h.canonical || '未回读'}`,
+      `尝试链：${trace}`,
+      h.error ? `错误：${h.error}` : '',
+    ].filter(Boolean).join('\n');
+    return `<tr>
+      <td>${fmt(h.ts)}</td>
+      <td class="mono">${escapeHtml(h.model || '—')}</td>
+      <td><span class="${bad ? 'status-bad' : 'status-ok'}">${bad ? '失败' : '成功'}${h.status ? ` · ${escapeHtml(h.status)}` : ''}</span></td>
+      <td>${h.provider ? `<span class="badge">${escapeHtml(h.provider)}</span>` : '<span class="dim">—</span>'}</td>
+      <td>${h.account ? `<span class="badge">${escapeHtml(h.account)}</span>` : '<span class="dim">—</span>'}</td>
+      <td>${h.ms ?? '—'} ms</td>
+      <td>${h.stream ? '流式' : '非流式'}<details class="history-detail"><summary>查看详情</summary><div>${escapeHtml(detail).replace(/\n/g, '<br>')}</div></details></td>
+    </tr>`;
+  }).join('') : '<tr><td colspan="7" class="empty">没有符合条件的记录</td></tr>';
+}
+async function loadHistory() {
+  const r = await api('/api/history');
+  HISTORY = Array.isArray(r.history) ? r.history : [];
+  renderHistory();
+}
 
 function renderAccounts() {
   if (!ACCS) return;

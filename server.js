@@ -217,17 +217,17 @@ function parseRouting(json) {
   };
 }
 
-// 故意携带不存在的 only，让网关在路由层报错并列出可用上游（不产生 token 消耗）。
+// 携带格式合法但不存在的 only，让仍支持钉住的网关列出可用上游。
 // - 直连管道（OpenRouter）：provider.only → 404 错误 JSON 里的 metadata.available_providers
 // - 规划器管道（Vercel AI Gateway）：providerOptions.gateway.only → 400 错误文本里的 "Available providers are: ..."
 async function harvestAvailableProviders(modelId, pipeline) {
   const acc = pickAccount();
   const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 16 };
   const body = pipeline === 'planner'
-    ? { ...base, providerOptions: { gateway: { only: ['__probe__'] } } }
-    : { ...base, provider: { only: ['__probe__'] } };
+    ? { ...base, providerOptions: { gateway: { only: ['zzz-not-a-provider'] } } }
+    : { ...base, provider: { only: ['zzz-not-a-provider'] } };
   const { json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, { method: 'POST', headers: chatHeaders(acc.key), body: JSON.stringify(body) }, 60000);
-  const err = json?.error;
+  const err = typeof json?.error === 'string' ? json.error : errText(json?.error);
   if (typeof err !== 'string') return null;
   if (pipeline === 'planner') {
     const m = /Available providers are:\s*([^.]+)/.exec(err);
@@ -241,6 +241,30 @@ async function harvestAvailableProviders(modelId, pipeline) {
   try {
     return JSON.parse(err.slice(i))?.error?.metadata?.available_providers || null;
   } catch { return null; }
+}
+
+// 用一个不存在但格式合法的渠道名判断网关是否仍读取钉住参数。
+// 返回 unsupported 表示请求成功但参数被静默忽略，supported 表示网关明确拒绝了该渠道。
+async function checkPinSupport(modelId, pipeline) {
+  const base = { model: modelId, messages: [{ role: 'user', content: 'hi' }], max_tokens: 1 };
+  const body = pipeline === 'planner'
+    ? { ...base, providerOptions: { gateway: { only: ['zzz-not-a-provider'] } } }
+    : { ...base, provider: { only: ['zzz-not-a-provider'] } };
+  try {
+    const { status, json } = await fetchJSON(`${config.upstreamBase}/chat/completions`, {
+      method: 'POST', headers: chatHeaders(pickAccount().key), body: JSON.stringify(body),
+    }, 60000);
+    const msg = errText(json?.error?.message ?? json?.error ?? '');
+    if (status === 200 && !json?.error) {
+      return { state: 'unsupported', reason: '网关已忽略上游钉住参数', checkedAt: Date.now() };
+    }
+    if (/available providers|no allowed providers|no available providers|invalid.*provider|provider.*(invalid|not found)/i.test(msg)) {
+      return { state: 'supported', reason: '网关仍读取上游钉住参数', checkedAt: Date.now() };
+    }
+    return { state: 'unknown', reason: msg.slice(0, 160) || `探测返回 HTTP ${status}`, checkedAt: Date.now() };
+  } catch (e) {
+    return { state: 'unknown', reason: `探测失败：${e.message}`, checkedAt: Date.now() };
+  }
 }
 function parseTier0(plan) {
   const m = /([\w-]+) won tier 0 over ([^."]+)/.exec(plan || '');
@@ -262,8 +286,9 @@ async function probeModel(modelId) {
     return { ok: false, error: typeof json.error === 'string' ? json.error : JSON.stringify(json.error) };
   }
   const r = parseRouting(json);
+  const pinSupport = r.pipeline ? await checkPinSupport(modelId, r.pipeline) : { state: 'unknown', reason: '未识别到可钉住的上游管道', checkedAt: Date.now() };
   let harvest = null;
-  if (r.pipeline) harvest = await harvestAvailableProviders(modelId, r.pipeline);
+  if (pinSupport.state === 'supported') harvest = await harvestAvailableProviders(modelId, r.pipeline);
   let endpoints = [];
   let orSlug = null;
   if (r.pipeline !== 'planner' && r.canonicalSlug) {
@@ -285,7 +310,8 @@ async function probeModel(modelId) {
     ...prev,
     ok: true,
     pipeline: r.pipeline,
-    pinnable: !!r.pipeline,
+    pinnable: pinSupport.state === 'supported',
+    pinSupport,
     availableProviders: harvest || prev.availableProviders || [],
     canonicalSlug: r.canonicalSlug,
     openrouterSlug: orSlug,
@@ -334,6 +360,7 @@ function learnAvailableProviders(modelId, errMsg) {
 // 批量校验：把模型的每个上游渠道用最小请求各钉一次，标记真实可用性
 async function validateUpstreams(modelId) {
   const meta = META.models[modelId] || {};
+  if (meta.pinSupport?.state !== 'supported') return {};
   const list = meta.upstreams || [];
   const pipeline = meta.pipeline;
   const acc = pickAccount();
@@ -413,8 +440,9 @@ async function fetchOfficialModels() {
 }
 
 function record(modelId, info) {
+  const ts = Date.now();
   META.models[modelId] = { ...(META.models[modelId] || {}), ...info };
-  META.history.unshift({ ts: Date.now(), model: modelId, ...info });
+  META.history.unshift({ ts, model: modelId, ...info });
   if (META.history.length > 100) META.history.length = 100;
   if (info.account) {
     META.stats = META.stats || {};
@@ -467,6 +495,7 @@ const OR_SORT = { cost: 'price', ttft: 'latency', tps: 'throughput' };
 // 严格钉住模式 only=[当前上游]，天然排除其他一切渠道。
 function injectPrefs(body, modelId, { upstream, orderRest = [], excludeList = [], strict = true, sort = null }) {
   const b = JSON.parse(JSON.stringify(body));
+  if (META.models[modelId]?.pinSupport?.state === 'unsupported') return b;
   const exclude = (excludeList || []).filter((u) => u !== upstream);
   const meta = META.models[modelId] || {};
   const known = meta.upstreams || [];
@@ -517,6 +546,9 @@ function buildAttempts(modelId, cfg) {
   const strict = (cfg?.pinMode || 'strict') === 'strict';
   const sort = cfg?.sort || null;
   const base = { strict, sort, excludeList: exclude };
+  if (META.models[modelId]?.pinSupport?.state === 'unsupported') {
+    return [{ ...base, upstream: null, orderRest: [], excludeList: [] }];
+  }
   if (wanted.length) {
     // preferred 模式：当前上游排在 order 首位，其余勾选项作为网关侧回退序列；排除列表随行（限制网关回退范围）
     return wanted.map((u, i) => ({ ...base, upstream: u, orderRest: strict ? [] : wanted.filter((_, j) => j !== i) }));
@@ -704,27 +736,38 @@ async function handleChat(req, res) {
           provider = fp ? fp[1] : null;
           canonical = cs ? cs[1] : null;
         }
-        record(modelId, { provider, canonical, ms: Date.now() - t0, stream: true, error: null, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto') });
+        recordStream({ provider, canonical, status: 200, error: null });
         cb();
       },
     });
-    // Web streams emit errors independently of pipe(); handle every leg so a
-    // terminated upstream only closes this response instead of the process.
+    // Web Stream 的错误不会由 pipe() 自动转发，必须逐段监听，避免上游断链带崩进程。
     const src = Readable.fromWeb(up.body);
+    let streamRecorded = false;
+    const recordStream = (info) => {
+      if (streamRecorded) return;
+      streamRecorded = true;
+      try {
+        record(modelId, { provider: null, canonical: null, ms: Date.now() - t0, stream: true, account: acc.name, attempts: chain.trace.map((t) => t.upstream || 'auto'), ...info });
+      } catch (e) {
+        console.warn(`[历史记录写入失败] ${e.message}`);
+      }
+    };
     src.on('error', (err) => {
       console.warn(`[流式上游中断] ${err.message}`);
-      try { res.destroy(); } catch { /* response may already be closed */ }
+      recordStream({ status: 502, error: `stream aborted: ${err.message}` });
+      try { res.destroy(); } catch { /* 响应可能已经关闭 */ }
     });
     tap.on('error', (err) => {
       console.warn(`[流式转发失败] ${err.message}`);
-      try { res.destroy(); } catch { /* response may already be closed */ }
+      recordStream({ status: 502, error: `stream forwarding failed: ${err.message}` });
+      try { res.destroy(); } catch { /* 响应可能已经关闭 */ }
     });
     res.on('error', () => {
-      try { src.destroy(); } catch { /* source may already be closed */ }
+      try { src.destroy(); } catch { /* 上游可能已经关闭 */ }
     });
     res.on('close', () => {
       if (!res.writableEnded) {
-        try { src.destroy(); } catch { /* source may already be closed */ }
+        try { src.destroy(); } catch { /* 上游可能已经关闭 */ }
       }
     });
     src.pipe(tap).pipe(res);
@@ -742,6 +785,7 @@ async function handleChat(req, res) {
     provider: routing.finalProvider || null,
     canonical: routing.canonicalSlug || null,
     ms: Date.now() - chain.t0,
+    status,
     stream: false,
     attempts: chain.trace.map((t) => t.upstream || 'auto'),
     trace: chain.trace,
@@ -823,16 +867,19 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 200, {
           ok: false, error: (chain.out?.error?.message || 'upstream error').slice?.(0, 400) || 'upstream error',
           targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [], trace,
+          pinnable: META.models[model]?.pinSupport?.state === 'supported', pinSupport: META.models[model]?.pinSupport || null,
         });
       }
       const r = parseRouting(chain.out);
-      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
+      record(model, { provider: r.finalProvider, canonical: r.canonicalSlug, ms: Date.now() - t0, status: 200, stream: false, attempts: trace.map((t) => t.upstream || 'auto'), error: null, account: chain.acc?.name || null });
       return sendJSON(res, 200, {
         ok: true, ms: Date.now() - t0,
         targets: (cfg.upstreams || []).filter(Boolean), exclude: cfg.exclude || [],
-        actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline, pinnable: r.pipeline !== null,
+        actual: r.finalProvider, actualName: r.finalProviderName, pipeline: r.pipeline,
+        pinnable: META.models[model]?.pinSupport?.state === 'supported', pinSupport: META.models[model]?.pinSupport || null,
         canonicalSlug: r.canonicalSlug, fallbacks: r.fallbacks, content: (r.content || '').slice(0, 120),
         account: chain.acc?.name || null, trace,
+        pinSupport: META.models[model]?.pinSupport || null,
       });
     }
     if (req.method === 'GET' && p === '/api/accounts') {
@@ -898,6 +945,9 @@ const server = http.createServer(async (req, res) => {
       const { model } = JSON.parse(await readBody(req).then((b) => b.toString()));
       if (!model) return sendJSON(res, 400, { error: { message: 'model required' } });
       const results = await validateUpstreams(model);
+      if (!Object.keys(results).length && META.models[model]?.pinSupport?.state !== 'supported') {
+        return sendJSON(res, 200, { ok: false, supported: false, pinSupport: META.models[model]?.pinSupport || null, results: {} });
+      }
       const summary = { ok: 0, limited: 0, bad: 0, auth: 0, unknown: 0 };
       for (const r of Object.values(results)) summary[r.status] = (summary[r.status] || 0) + 1;
       return sendJSON(res, 200, { ok: true, summary, results, upstreams: META.models[model]?.upstreams || [] });
