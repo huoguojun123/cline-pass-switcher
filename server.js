@@ -708,7 +708,26 @@ async function handleChat(req, res) {
         cb();
       },
     });
-    Readable.fromWeb(up.body).pipe(tap).pipe(res);
+    // Web streams emit errors independently of pipe(); handle every leg so a
+    // terminated upstream only closes this response instead of the process.
+    const src = Readable.fromWeb(up.body);
+    src.on('error', (err) => {
+      console.warn(`[流式上游中断] ${err.message}`);
+      try { res.destroy(); } catch { /* response may already be closed */ }
+    });
+    tap.on('error', (err) => {
+      console.warn(`[流式转发失败] ${err.message}`);
+      try { res.destroy(); } catch { /* response may already be closed */ }
+    });
+    res.on('error', () => {
+      try { src.destroy(); } catch { /* source may already be closed */ }
+    });
+    res.on('close', () => {
+      if (!res.writableEnded) {
+        try { src.destroy(); } catch { /* source may already be closed */ }
+      }
+    });
+    src.pipe(tap).pipe(res);
     return;
   }
 
